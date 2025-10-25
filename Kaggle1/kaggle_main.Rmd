@@ -4,30 +4,78 @@ output: html_document
 date: "2025-10-21"
 ---
 
+##import data
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
-```
 
-## R Markdown
-
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
-
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
-
-## import data
-```{r cars}
 data_training <- read.csv("./mlai-2025-regression-challenge/train.csv")
 data_test <- read.csv("./mlai-2025-regression-challenge/test.csv")
 data_sample <- read.csv("./mlai-2025-regression-challenge/sample_submission.csv")
+
+
+```
+
+```{r}
+#cleaning if necessary
+rm(list = ls())
+```
+
+
+```{r}
+#load packages and set working directory
+library(tidyverse)
+library(dplyr)
+library(stringr)
+library(tidytext)
+library(ggplot2)
+```
+
+
+```{r}
+# inspect the data
+glimpse(data_training)
+```
+```{r}
+summary(data_training)
+```
+
+```{r}
+str(data_training)
+```
+
+```{r}
+#check number of unique values
+data_training %>% summarise(across(everything(), n_distinct))
+```
+
+## Check for NA's
+```{r}
+colSums(is.na(data_training))
+
+data_training %>%
+ filter(is.na(reviews_per_month), number_of_reviews == 0 )
+# We have a lot of NA#S in the reviews_per_month columns -> set to 0 should do the Job
+# Also host_name and name can be replaced by no_name, since there are not a lot of information missing goin to lose.
+```
+```{r}
+
+data_training$reviews_per_month <- replace_na(data_training$reviews_per_month, 0)
+colSums(is.na(data_training))
+```
+
+
+## Transform variables
+```{r}
+# transform some variables into factor variables
+
 
 ```
 
 ## Including Plots
 
-You can also embed plots, for example:
+
 
 ```{r pressure, echo=FALSE}
-plot(pressure)
+
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+
