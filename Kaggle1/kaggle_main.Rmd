@@ -1,81 +1,315 @@
----
-title: "kaggle_main"
-output: html_document
-date: "2025-10-21"
----
+############################################################
+# Airbnb Chicago Price Prediction - Data Preparation Script
+# Goal: Prepare data for regression modeling (minimize RMSE)
+############################################################
 
-##import data
-```{r setup, include=FALSE}
-
-data_training <- read.csv("./mlai-2025-regression-challenge/train.csv")
-data_test <- read.csv("./mlai-2025-regression-challenge/test.csv")
-data_sample <- read.csv("./mlai-2025-regression-challenge/sample_submission.csv")
-
-
-```
-
+# ----- 1. Load Required Libraries -----
 ```{r}
-#cleaning if necessary
-rm(list = ls())
-```
-
-
-```{r}
-#load packages and set working directory
-library(tidyverse)
 library(dplyr)
-library(stringr)
-library(tidytext)
 library(ggplot2)
+library(geosphere)
+library(fastDummies)
 ```
 
-
+# ----- 2. Load Data -----
 ```{r}
-# inspect the data
-glimpse(data_training)
+# Read training and test data
+train_raw <- read.csv("mlai-2025-regression-challenge/train.csv")
+test_raw  <- read.csv("mlai-2025-regression-challenge/test.csv")
+
+# Create working copies to keep originals unchanged
+train <- train_raw
+test  <- test_raw
+
+# Display basic structure of the datasets
+cat("Training set summary:\n")
+summary(train)
+cat("\nTest set summary:\n")
+summary(test)
 ```
+
+# ----- 3. Basic Data Cleaning -----
 ```{r}
-summary(data_training)
+# Remove columns that do not contain predictive information
+train <- train %>% select(-ID, -host_id, -name, -host_name)
+test  <- test  %>% select(-ID, -host_id, -name, -host_name)
+
+# Check for missing values
+cat("\nMissing values per column (train):\n")
+print(colSums(is.na(train)))
+cat("\nMissing values per column (test):\n")
+print(colSums(is.na(test)))
+
+# Replace missing values in 'reviews_per_month' with 0
+# Interpretation: missing means no reviews yet
+train$reviews_per_month[is.na(train$reviews_per_month)] <- 0
+test$reviews_per_month[is.na(test$reviews_per_month)] <- 0
+
+# Verify that missing values have been handled
+cat("\nAfter imputation, missing values per column (train):\n")
+print(colSums(is.na(train)))
 ```
 
+# ----- 4. Variable Transformations -----
 ```{r}
-str(data_training)
+# Apply a log transformation to price to reduce the impact of extreme outliers
+train <- train %>%
+  mutate(log_price = log1p(price))
 ```
 
+# ----- 5. Add Geographic Feature: Distance to City Center -----
 ```{r}
-#check number of unique values
-data_training %>% summarise(across(everything(), n_distinct))
+# Coordinates of Chicago’s main urban center (The Loop)
+center_lon <- -87.6298
+center_lat <- 41.8781
+
+# Calculate distance (in kilometers) to the city center using Haversine formula
+train$dist_to_center <- distHaversine(
+  cbind(train$longitude, train$latitude),
+  c(center_lon, center_lat)
+) / 1000
+
+test$dist_to_center <- distHaversine(
+  cbind(test$longitude, test$latitude),
+  c(center_lon, center_lat)
+) / 1000
+
+# Check distance distribution to ensure plausible range
+summary(train$dist_to_center)
 ```
 
-## Check for NA's
+# ----- 6. Additional Feature Engineering -----
 ```{r}
-colSums(is.na(data_training))
+# Create a review ratio (popularity measure) and log-transform minimum nights
+train <- train %>%
+  mutate(
+    reviews_ratio = number_of_reviews / (reviews_per_month + 1),
+    min_nights_log = log1p(minimum_nights)
+  )
 
-data_training %>%
- filter(is.na(reviews_per_month), number_of_reviews == 0 )
-# We have a lot of NA#S in the reviews_per_month columns -> set to 0 should do the Job
-# Also host_name and name can be replaced by no_name, since there are not a lot of information missing goin to lose.
+test <- test %>%
+  mutate(
+    reviews_ratio = number_of_reviews / (reviews_per_month + 1),
+    min_nights_log = log1p(minimum_nights)
+  )
+
+# Confirm that no new missing values were introduced
+cat("\nCheck NAs after feature engineering:\n")
+print(colSums(is.na(train)))
 ```
+
+# ----- 7. Encode Room Type (One-Hot Encoding) -----
 ```{r}
+# Convert categorical variable 'room_type' into dummy columns (0/1)
+train <- dummy_cols(train, select_columns = "room_type", remove_selected_columns = TRUE)
+test  <- dummy_cols(test,  select_columns = "room_type", remove_selected_columns = TRUE)
 
-data_training$reviews_per_month <- replace_na(data_training$reviews_per_month, 0)
-colSums(is.na(data_training))
+# Confirm that encoding worked correctly
+cat("\nEncoded room_type columns in train:\n")
+print(names(train)[grepl("room_type_", names(train))])
+
+# Check if train and test have matching column names
+setdiff(names(train), names(test))
 ```
 
-
-## Transform variables
+# ----- 8. Encode Neighbourhood (Target Mean Encoding) -----
 ```{r}
-# transform some variables into factor variables
+# Compute average log_price per neighbourhood (train only)
+neigh_price_mean <- train %>%
+  group_by(neighbourhood) %>%
+  summarise(mean_log_price = mean(log_price, na.rm = TRUE))
 
+# Merge this mean price into both train and test sets
+train <- left_join(train, neigh_price_mean, by = "neighbourhood")
+test  <- left_join(test,  neigh_price_mean, by = "neighbourhood")
 
+# Handle neighbourhoods in test set not present in train
+global_mean <- mean(train$log_price, na.rm = TRUE)
+test$mean_log_price[is.na(test$mean_log_price)] <- global_mean
+
+# Drop the original neighbourhood column
+train <- select(train, -neighbourhood)
+test  <- select(test,  -neighbourhood)
+
+# Quick check to ensure reasonable distribution
+summary(train$mean_log_price)
+ggplot(train, aes(x = mean_log_price)) +
+  geom_histogram(fill = "steelblue", bins = 30) +
+  labs(title = "Distribution of Target-Encoded Neighbourhood Feature")
 ```
 
-## Including Plots
+# ----- 9. Temporal Feature: Days Since Last Review -----
+```{r}
+# Convert 'last_review' to Date format
+train$last_review <- as.Date(train$last_review)
+test$last_review  <- as.Date(test$last_review)
 
+# Identify the most recent review date across all data
+ref_date <- max(train$last_review, test$last_review, na.rm = TRUE)
+cat("\nReference date (most recent review in dataset):", ref_date, "\n")
 
+# Calculate number of days since the last review
+train <- train %>%
+  mutate(days_since_last_review = as.numeric(ref_date - last_review))
+test <- test %>%
+  mutate(days_since_last_review = as.numeric(ref_date - last_review))
 
-```{r pressure, echo=FALSE}
+# Replace NAs (no reviews) with the maximum observed value
+max_days <- max(train$days_since_last_review, test$days_since_last_review, na.rm = TRUE)
+train$days_since_last_review[is.na(train$days_since_last_review)] <- max_days
+test$days_since_last_review[is.na(test$days_since_last_review)] <- max_days
 
+# Log-transform for numerical stability
+train$log_days_since_last_review <- log1p(train$days_since_last_review)
+test$log_days_since_last_review  <- log1p(test$days_since_last_review)
+
+# Basic summary for verification
+cat("\nSummary of 'days_since_last_review':\n")
+summary(train$days_since_last_review)
+
+# Visualization of the distribution
+ggplot(train, aes(x = days_since_last_review)) +
+  geom_histogram(fill = "steelblue", bins = 30) +
+  labs(title = "Distribution of Days Since Last Review",
+       x = "Days since last review",
+       y = "Count")
 ```
+
+# ----- 10. Temporal Seasonality Feature (Extended Summer Season) -----
+```{r}
+# Reviews are often written days or even weeks after a stay.
+# In the dataset, September shows the highest number of reviews,
+# likely reflecting delayed reviews from summer guests.
+# Therefore, the high (summer) season is extended to June–September
+# to better capture actual booking activity and demand patterns.
+
+# Extract the month of the last review
+train$review_month <- as.numeric(format(train$last_review, "%m"))
+test$review_month  <- as.numeric(format(test$last_review, "%m"))
+
+# Define summer season as June–September (months 6–9)
+train$is_summer_season <- ifelse(train$review_month %in% c(6, 7, 8, 9), 1, 0)
+test$is_summer_season  <- ifelse(test$review_month %in% c(6, 7, 8, 9), 1, 0)
+
+# Replace NAs (listings without reviews) with 0 = not in summer season / inactive
+train$review_month[is.na(train$review_month)] <- 0
+test$review_month[is.na(test$review_month)]   <- 0
+train$is_summer_season[is.na(train$is_summer_season)] <- 0
+test$is_summer_season[is.na(test$is_summer_season)]   <- 0
+
+# Quick check to verify transformation
+cat("\nSummary of seasonal features (with extended summer definition):\n")
+summary(train[, c("review_month", "is_summer_season")])
+
+# Optional visualization to confirm monthly pattern
+ggplot(train, aes(x = review_month, fill = factor(is_summer_season))) +
+  geom_bar() +
+  labs(
+    title = "Distribution of Last Review by Month",
+    x = "Review Month",
+    y = "Listing Count",
+    fill = "Summer Season (June–September)"
+  ) +
+  theme_minimal()
+```
+
+
+# ----- 11. Remove Original Date Column -----
+```{r}
+# The original date variable is no longer needed
+train <- select(train, -last_review)
+test  <- select(test,  -last_review)
+train <- select(train, -minimum_nights, -days_since_last_review)
+test  <- select(test,  -minimum_nights, -days_since_last_review)
+```
+
+
+# ----- 12. Final Data Integrity Check -----
+```{r}
+cat("\nFinal missing value counts (train):\n")
+print(colSums(is.na(train)))
+cat("\nFinal missing value counts (test):\n")
+print(colSums(is.na(test)))
+
+cat("\nFinal training columns:\n")
+print(names(train))
+
+# ----- Correlation Analysis: log_price vs. Numerical Features -----
+
+# Select only numeric features
+numeric_features <- select_if(train, is.numeric)
+
+# Compute correlation matrix (complete cases only)
+cor_matrix <- cor(numeric_features, use = "complete.obs")
+
+# Print all correlations with log_price
+cat("\nCorrelation of numerical features with log_price:\n")
+print(sort(cor_matrix["log_price", ], decreasing = TRUE))
+
+# --- Visualize correlations with a bar plot ---
+
+# Convert correlations into a tidy dataframe for plotting
+cor_data <- data.frame(
+  feature = names(cor_matrix["log_price", ]),
+  correlation = cor_matrix["log_price", ]
+) %>%
+  filter(feature != "log_price") %>%                # exclude self-correlation
+  arrange(desc(abs(correlation)))                   # order by absolute correlation strength
+
+# Plot correlation strength
+ggplot(cor_data, aes(x = reorder(feature, correlation), y = correlation, fill = correlation > 0)) +
+  geom_bar(stat = "identity", show.legend = FALSE) +
+  coord_flip() +
+  labs(
+    title = "Correlation of Features with log_price",
+    x = "Feature",
+    y = "Pearson Correlation"
+  ) +
+  theme_minimal() +
+  geom_text(aes(label = round(correlation, 2)), hjust = ifelse(cor_data$correlation > 0, -0.2, 1.2), size = 3) +
+  scale_fill_manual(values = c("TRUE" = "steelblue", "FALSE" = "firebrick"))
+
+# ----- Multicollinearity Check: Correlation Heatmap -----
+
+library(reshape2)
+
+# Compute correlation matrix for numeric features
+cor_matrix <- cor(select_if(train, is.numeric), use = "complete.obs")
+
+# Melt matrix into long format for ggplot
+cor_melt <- melt(cor_matrix)
+
+# Round correlation values to 2 decimal places for labeling
+cor_melt$value <- round(cor_melt$value, 2)
+
+# Plot correlation heatmap with text annotations
+ggplot(cor_melt, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile(color = "white") +  # adds white gridlines
+  geom_text(aes(label = sprintf("%.2f", value)), size = 3) +  # two decimals
+  scale_fill_gradient2(
+    low = "firebrick",
+    mid = "white",
+    high = "steelblue",
+    midpoint = 0,
+    limits = c(-1, 1)
+  ) +
+  labs(
+    title = "Feature Correlation Heatmap (rounded to 2 decimals)",
+    x = "Feature",
+    y = "Feature",
+    fill = "Correlation"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank(),
+    plot.title = element_text(hjust = 0.5)
+  )
+```
+
+############################################################
+
+
+
 
 
