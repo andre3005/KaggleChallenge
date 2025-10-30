@@ -309,8 +309,102 @@ ggplot(cor_melt, aes(x = Var1, y = Var2, fill = value)) +
   )
 
 
-############################################################
+# ==========================================================
+# 13) REGRESSION SPLINES (Natural Splines über Distanz/Koordinaten)
+#    -> linear_reg + step_ns(), df werden getuned
+# ==========================================================
+rec_splines <- recipe(log_price ~ ., data = train) |>
+  step_zv(all_predictors()) |>
+  step_ns(dist_to_center, deg_free = tune("df_dist")) |>
+  step_ns(latitude,       deg_free = tune("df_lat"))  |>
+  step_ns(longitude,      deg_free = tune("df_lon")) |>
+  step_normalize(all_numeric_predictors())
 
+mod_splines <- linear_reg() |>
+  set_engine("lm")
+
+wf_splines <- workflow() |>
+  add_model(mod_splines) |>
+  add_recipe(rec_splines)
+
+grid_splines <- grid_regular(
+  df_dist(range = c(3L, 7L)),
+  df_lat (range = c(3L, 6L)),
+  df_lon (range = c(3L, 6L)),
+  levels = 3
+)
+
+res_splines <- tune_grid(
+  wf_splines,
+  resamples = folds,
+  grid = grid_splines,
+  metrics = metric_set(rmse),
+  control = control_grid(save_workflow = TRUE, verbose = TRUE)
+)
+
+best_splines   <- select_best(res_splines, "rmse")
+final_wf_spl   <- finalize_workflow(wf_splines, best_splines)
+final_splines  <- fit(final_wf_spl, data = train)
+
+make_submission(final_splines, test, test_ids, "submission_splines_tuned.csv")
+
+# RMSE-Report (optional):
+print(collect_metrics(res_splines) |> arrange(mean))
+
+# ==========================================================
+# 3) BAGGING (echtes Bagging von Entscheidungsbäumen)
+#    -> baguette::bag_tree (full features, kein mtry-Sampling)
+# ==========================================================
+rec_bag <- recipe(log_price ~ ., data = train) |>
+  step_zv(all_predictors())  # Trees brauchen i.d.R. keine Standardisierung
+
+mod_bag <- bag_tree(
+  cost_complexity = tune(),
+  tree_depth      = tune(),
+  min_n           = tune()
+) |>
+  set_mode("regression") |>
+  set_engine("rpart", times = tune())  # 'times' = Anzahl der gebootstrappten Bäume
+
+wf_bag <- workflow() |>
+  add_model(mod_bag) |>
+  add_recipe(rec_bag)
+
+grid_bag <- grid_regular(
+  cost_complexity(range = c(-5, -1)),   # log10-Space intern
+  tree_depth(range = c(4L, 12L)),
+  min_n(range = c(5L, 30L)),
+  levels = 4
+) |>
+  mutate(times = c(50L, 100L, 200L, 300L))
+
+res_bag <- tune_grid(
+  wf_bag,
+  resamples = folds,
+  grid = grid_bag,
+  metrics = metric_set(rmse),
+  control = control_grid(save_workflow = TRUE, verbose = TRUE)
+)
+
+best_bag  <- select_best(res_bag, "rmse")
+final_wf_bag <- finalize_workflow(wf_bag, best_bag)
+final_bag <- fit(final_wf_bag, data = train)
+
+make_submission(final_bag, test, test_ids, "submission_bagging_tuned.csv")
+
+# RMSE-Report):
+print(collect_metrics(res_bag) |> arrange(mean))
+
+# ==========================================================
+# (Mini-Ensemble optional): Mittel der beiden im Log-Space
+# ==========================================================
+pred_spl_log <- predict(final_splines, new_data = test)$.pred
+pred_bag_log <- predict(final_bag,     new_data = test)$.pred
+pred_ens     <- pmax(0, expm1((pred_spl_log + pred_bag_log)/2))
+write.csv(data.frame(ID = test_ids, price = pred_ens),
+          "submission_ensemble_splines_bagging.csv", row.names = FALSE)
+message("Wrote: submission_ensemble_splines_bagging.csv")
+############################################################
 
 
 
