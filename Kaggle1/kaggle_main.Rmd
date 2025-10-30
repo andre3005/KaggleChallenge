@@ -4,15 +4,15 @@
 ############################################################
 
 # ----- 1. Load Required Libraries -----
-
+```{r}
 library(dplyr)
 library(ggplot2)
 library(geosphere)
 library(fastDummies)
-
+```
 
 # ----- 2. Load Data -----
-
+```{r}
 # Read training and test data
 train_raw <- read.csv("~/Documents/Uni/Master/Machine learning/mlai-2025-regression-challenge/train.csv")
 test_raw  <- read.csv("~/Documents/Uni/Master/Machine learning/mlai-2025-regression-challenge/test.csv")
@@ -26,10 +26,10 @@ cat("Training set summary:\n")
 summary(train)
 cat("\nTest set summary:\n")
 summary(test)
-
+```
 
 # ----- 3. Basic Data Cleaning -----
-
+```{r}
 # Remove columns that do not contain predictive information
 train <- train %>% select(-ID, -host_id, -name, -host_name)
 test  <- test  %>% select(-ID, -host_id, -name, -host_name)
@@ -48,17 +48,17 @@ test$reviews_per_month[is.na(test$reviews_per_month)] <- 0
 # Verify that missing values have been handled
 cat("\nAfter imputation, missing values per column (train):\n")
 print(colSums(is.na(train)))
-
+```
 
 # ----- 4. Variable Transformations -----
-
+```{r}
 # Apply a log transformation to price to reduce the impact of extreme outliers
 train <- train %>%
   mutate(log_price = log1p(price))
-
+```
 
 # ----- 5. Add Geographic Feature: Distance to City Center -----
-
+```{r}
 # Coordinates of Chicago’s main urban center (The Loop)
 center_lon <- -87.6298
 center_lat <- 41.8781
@@ -76,10 +76,10 @@ test$dist_to_center <- distHaversine(
 
 # Check distance distribution to ensure plausible range
 summary(train$dist_to_center)
-
+```
 
 # ----- 6. Additional Feature Engineering -----
-
+```{r}
 # Create a review ratio (popularity measure) and log-transform minimum nights
 train <- train %>%
   mutate(
@@ -96,10 +96,10 @@ test <- test %>%
 # Confirm that no new missing values were introduced
 cat("\nCheck NAs after feature engineering:\n")
 print(colSums(is.na(train)))
-
+```
 
 # ----- 7. Encode Room Type (One-Hot Encoding) -----
-
+```{r}
 # Convert categorical variable 'room_type' into dummy columns (0/1)
 train <- dummy_cols(train, select_columns = "room_type", remove_selected_columns = TRUE)
 test  <- dummy_cols(test,  select_columns = "room_type", remove_selected_columns = TRUE)
@@ -110,10 +110,10 @@ print(names(train)[grepl("room_type_", names(train))])
 
 # Check if train and test have matching column names
 setdiff(names(train), names(test))
-
+```
 
 # ----- 8. Encode Neighbourhood (Target Mean Encoding) -----
-
+```{r}
 # Compute average log_price per neighbourhood (train only)
 neigh_price_mean <- train %>%
   group_by(neighbourhood) %>%
@@ -136,10 +136,10 @@ summary(train$mean_log_price)
 ggplot(train, aes(x = mean_log_price)) +
   geom_histogram(fill = "steelblue", bins = 30) +
   labs(title = "Distribution of Target-Encoded Neighbourhood Feature")
-
+```
 
 # ----- 9. Temporal Feature: Days Since Last Review -----
-
+```{r}
 # Convert 'last_review' to Date format
 train$last_review <- as.Date(train$last_review)
 test$last_review  <- as.Date(test$last_review)
@@ -173,12 +173,12 @@ ggplot(train, aes(x = days_since_last_review)) +
   labs(title = "Distribution of Days Since Last Review",
        x = "Days since last review",
        y = "Count")
-
+```
 
 # ----- 10. Temporal Feature: Cyclical Encoding of Review Month -----
 # Encode month of last review as cyclical features using sine and cosine transformation.
 # This captures seasonal patterns smoothly for both linear and non-linear models.
-
+```{r}
 # Extract review month (1–12)
 train$review_month <- as.numeric(format(train$last_review, "%m"))
 test$review_month  <- as.numeric(format(test$last_review, "%m"))
@@ -215,19 +215,19 @@ ggplot(month_grid, aes(x = sin, y = cos, label = month)) +
     y = "cos(2π * month / 12)"
   ) +
   theme_minimal()
+```
 
 
-
-
+```{r}
 # ----- 11. Remove Original Date Columns -----
 train <- select(train, -last_review, -minimum_nights, -days_since_last_review, -latitude, -longitude)
 test  <- select(test,  -last_review, -minimum_nights, -days_since_last_review, -latitude, -longitude)
-
+```
 
 
 
 # ----- 12. Final Data Integrity Check -----
-
+```{r}
 cat("\nFinal missing value counts (train):\n")
 print(colSums(is.na(train)))
 cat("\nFinal missing value counts (test):\n")
@@ -307,12 +307,13 @@ ggplot(cor_melt, aes(x = Var1, y = Var2, fill = value)) +
     panel.grid = element_blank(),
     plot.title = element_text(hjust = 0.5)
   )
-
+```
 
 # ==========================================================
 # 13) REGRESSION SPLINES (Natural Splines über Distanz/Koordinaten)
 #    -> linear_reg + step_ns(), df werden getuned
 # ==========================================================
+```{r}
 rec_splines <- recipe(log_price ~ ., data = train) |>
   step_zv(all_predictors()) |>
   step_ns(dist_to_center, deg_free = tune("df_dist")) |>
@@ -394,10 +395,14 @@ make_submission(final_bag, test, test_ids, "submission_bagging_tuned.csv")
 
 # RMSE-Report):
 print(collect_metrics(res_bag) |> arrange(mean))
+```
+
 
 # ==========================================================
 # (Mini-Ensemble optional): Mittel der beiden im Log-Space
 # ==========================================================
+
+```{r}
 pred_spl_log <- predict(final_splines, new_data = test)$.pred
 pred_bag_log <- predict(final_bag,     new_data = test)$.pred
 pred_ens     <- pmax(0, expm1((pred_spl_log + pred_bag_log)/2))
@@ -413,5 +418,5 @@ message("Wrote: submission_ensemble_splines_bagging.csv")
 
 
 test
-
+```
 
