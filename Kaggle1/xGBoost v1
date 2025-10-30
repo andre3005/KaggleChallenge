@@ -1,0 +1,130 @@
+
+############################################################
+
+############################################################
+# ----- 13. Model Training: XGBoost Regression (Full Train) -----
+############################################################
+
+library(xgboost)
+library(caret)
+library(Matrix)
+
+# ----- Step 1: Prepare Data -----
+
+# Features (X) and target (y)
+X_train <- train %>% select(-price, -log_price)
+y_train <- train$log_price
+
+# Convert to DMatrix format
+dtrain <- xgb.DMatrix(data = as.matrix(X_train), label = y_train)
+
+# ----- Step 2: Define model parameters -----
+
+params <- list(
+  objective = "reg:squarederror",   # regression loss
+  eval_metric = "rmse",
+  eta = 0.05,           # learning rate
+  max_depth = 6,        # tree depth
+  subsample = 0.8,      # row sampling
+  colsample_bytree = 0.8,  # feature sampling
+  min_child_weight = 5,
+  lambda = 1,
+  alpha = 0
+)
+
+# ----- Step 3: Cross-Validation for performance estimate -----
+
+set.seed(42)
+cv_model <- xgb.cv(
+  params = params,
+  data = dtrain,
+  nrounds = 2000,
+  nfold = 5,                      # 5-fold cross-validation
+  early_stopping_rounds = 50,
+  verbose = 1
+)
+
+best_nrounds <- cv_model$best_iteration
+cat("\nBest number of boosting rounds (from CV):", best_nrounds, "\n")
+
+# ----- Step 4: Train final model on full training data -----
+
+xgb_model <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = best_nrounds,
+  print_every_n = 50
+)
+
+# ----- Step 5: Evaluate model performance on training data -----
+
+pred_train <- predict(xgb_model, as.matrix(X_train))
+rmse_train <- sqrt(mean((pred_train - y_train)^2))
+cat("\nTraining RMSE:", round(rmse_train, 4), "\n")
+
+# ----- Step 6: Feature Importance -----
+
+importance <- xgb.importance(model = xgb_model)
+xgb.plot.importance(importance, top_n = 15, rel_to_first = TRUE, xlab = "Relative Importance")
+
+# ----- Step 7: Predict on Test Data -----
+
+dtest <- xgb.DMatrix(data = as.matrix(test))
+test_pred_log <- predict(xgb_model, dtest)
+test_pred_price <- expm1(test_pred_log)
+
+submission <- data.frame(
+  ID = test_raw$ID,
+  price = round(test_pred_price, 2)
+)
+
+write.csv(submission, "submission_xgboost_fulltrain.csv", row.names = FALSE)
+
+cat("\n✅ XGBoost model training complete. Submission file saved as 'submission_xgboost_fulltrain.csv'\n")
+
+############################################################
+# ----- 14. XGBoost Hyperparameter Tuning (Grid Search) -----
+############################################################
+
+library(caret)
+
+set.seed(42)
+
+# Define search grid
+xgb_grid <- expand.grid(
+  nrounds = c(150, 250, 400),      # number of boosting rounds
+  max_depth = c(4, 6, 8),          # tree depth
+  eta = c(0.03, 0.05, 0.1),        # learning rate
+  gamma = 0,                       # regularization term
+  colsample_bytree = c(0.7, 0.9),
+  min_child_weight = c(1, 3, 5),
+  subsample = c(0.7, 0.9)
+)
+
+# Set up 5-fold cross-validation
+train_control <- trainControl(
+  method = "cv",
+  number = 5,
+  verboseIter = TRUE,
+  allowParallel = TRUE
+)
+
+# Train models across grid
+xgb_tuned <- train(
+  x = as.matrix(X_train),
+  y = y_train,
+  trControl = train_control,
+  tuneGrid = xgb_grid,
+  method = "xgbTree",
+  metric = "RMSE"
+)
+
+# ----- Results -----
+cat("\nBest tuning parameters:\n")
+print(xgb_tuned$bestTune)
+
+cat("\nBest cross-validated RMSE:\n")
+print(min(xgb_tuned$results$RMSE))
+
+# Plot tuning results
+plot(xgb_tuned)
