@@ -1,0 +1,483 @@
+---
+title: "Untitled"
+output: html_document
+date: "2025-10-31"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+############################################################
+# Airbnb Chicago Price Prediction - Data Preparation Script
+# Goal: Prepare data for regression modeling (minimize RMSE)
+############################################################
+
+# ----- 1. Load Required Libraries -----
+```{r}
+library(dplyr)
+library(ggplot2)
+library(geosphere)
+library(fastDummies)
+```
+
+# ----- 2. Load Data -----
+```{r}
+# Read training and test data
+train_raw <- read.csv("~/Desktop/Gruppenprojekte/Kaggle Challenge I/train.csv")
+test_raw  <- read.csv("~/Desktop/Gruppenprojekte/Kaggle Challenge I/test.csv")
+
+# Create working copies to keep originals unchanged
+train <- train_raw
+test  <- test_raw
+
+# Display basic structure of the datasets
+cat("Training set summary:\n")
+summary(train)
+cat("\nTest set summary:\n")
+summary(test)
+```
+
+# ----- 3. Basic Data Cleaning -----
+```{r}
+# Remove columns that do not contain predictive information
+train <- train %>% select(-ID, -host_id, -name, -host_name)
+test  <- test  %>% select(-ID, -host_id, -name, -host_name)
+
+# Check for missing values
+cat("\nMissing values per column (train):\n")
+print(colSums(is.na(train)))
+cat("\nMissing values per column (test):\n")
+print(colSums(is.na(test)))
+
+# Replace missing values in 'reviews_per_month' with 0
+# Interpretation: missing means no reviews yet
+train$reviews_per_month[is.na(train$reviews_per_month)] <- 0
+test$reviews_per_month[is.na(test$reviews_per_month)] <- 0
+
+# Verify that missing values have been handled
+cat("\nAfter imputation, missing values per column (train):\n")
+print(colSums(is.na(train)))
+```
+
+# ----- 4. Variable Transformations -----
+```{r}
+# Apply a log transformation to price to reduce the impact of extreme outliers
+train <- train %>%
+  mutate(log_price = log1p(price))
+```
+
+# ----- 5. Add Geographic Feature: Distance to City Center -----
+```{r}
+# Coordinates of Chicago’s main urban center (The Loop)
+center_lon <- -87.6298
+center_lat <- 41.8781
+
+# Calculate distance (in kilometers) to the city center using Haversine formula
+train$dist_to_center <- distHaversine(
+  cbind(train$longitude, train$latitude),
+  c(center_lon, center_lat)
+) / 1000
+
+test$dist_to_center <- distHaversine(
+  cbind(test$longitude, test$latitude),
+  c(center_lon, center_lat)
+) / 1000
+
+# Check distance distribution to ensure plausible range
+summary(train$dist_to_center)
+```
+
+# ----- 6. Additional Feature Engineering -----
+```{r}
+# Create a review ratio (popularity measure) and log-transform minimum nights
+train <- train %>%
+  mutate(
+    reviews_ratio = number_of_reviews / (reviews_per_month + 1),
+    min_nights_log = log1p(minimum_nights)
+  )
+
+test <- test %>%
+  mutate(
+    reviews_ratio = number_of_reviews / (reviews_per_month + 1),
+    min_nights_log = log1p(minimum_nights)
+  )
+
+# Confirm that no new missing values were introduced
+cat("\nCheck NAs after feature engineering:\n")
+print(colSums(is.na(train)))
+```
+
+# ----- 7. Encode Room Type (One-Hot Encoding) -----
+```{r}
+# Convert categorical variable 'room_type' into dummy columns (0/1)
+train <- dummy_cols(train, select_columns = "room_type", remove_selected_columns = TRUE)
+test  <- dummy_cols(test,  select_columns = "room_type", remove_selected_columns = TRUE)
+
+# Confirm that encoding worked correctly
+cat("\nEncoded room_type columns in train:\n")
+print(names(train)[grepl("room_type_", names(train))])
+
+# Check if train and test have matching column names
+setdiff(names(train), names(test))
+```
+
+# ----- 8. Encode Neighbourhood (Target Mean Encoding) -----
+```{r}
+# Compute average log_price per neighbourhood (train only)
+neigh_price_mean <- train %>%
+  group_by(neighbourhood) %>%
+  summarise(mean_log_price = mean(log_price, na.rm = TRUE))
+
+# Merge this mean price into both train and test sets
+train <- left_join(train, neigh_price_mean, by = "neighbourhood")
+test  <- left_join(test,  neigh_price_mean, by = "neighbourhood")
+
+# Handle neighbourhoods in test set not present in train
+global_mean <- mean(train$log_price, na.rm = TRUE)
+test$mean_log_price[is.na(test$mean_log_price)] <- global_mean
+
+# Drop the original neighbourhood column
+train <- select(train, -neighbourhood)
+test  <- select(test,  -neighbourhood)
+
+# Quick check to ensure reasonable distribution
+summary(train$mean_log_price)
+ggplot(train, aes(x = mean_log_price)) +
+  geom_histogram(fill = "steelblue", bins = 30) +
+  labs(title = "Distribution of Target-Encoded Neighbourhood Feature")
+```
+
+# ----- 9. Temporal Feature: Days Since Last Review -----
+```{r}
+# Convert 'last_review' to Date format
+train$last_review <- as.Date(train$last_review)
+test$last_review  <- as.Date(test$last_review)
+
+# Identify the most recent review date across all data
+ref_date <- max(train$last_review, test$last_review, na.rm = TRUE)
+cat("\nReference date (most recent review in dataset):", ref_date, "\n")
+
+# Calculate number of days since the last review
+train <- train %>%
+  mutate(days_since_last_review = as.numeric(ref_date - last_review))
+test <- test %>%
+  mutate(days_since_last_review = as.numeric(ref_date - last_review))
+
+# Replace NAs (no reviews) with the maximum observed value
+max_days <- max(train$days_since_last_review, test$days_since_last_review, na.rm = TRUE)
+train$days_since_last_review[is.na(train$days_since_last_review)] <- max_days
+test$days_since_last_review[is.na(test$days_since_last_review)] <- max_days
+
+# Log-transform for numerical stability
+train$log_days_since_last_review <- log1p(train$days_since_last_review)
+test$log_days_since_last_review  <- log1p(test$days_since_last_review)
+
+# Basic summary for verification
+cat("\nSummary of 'days_since_last_review':\n")
+summary(train$days_since_last_review)
+
+# Visualization of the distribution
+ggplot(train, aes(x = days_since_last_review)) +
+  geom_histogram(fill = "steelblue", bins = 30) +
+  labs(title = "Distribution of Days Since Last Review",
+       x = "Days since last review",
+       y = "Count")
+```
+
+# ----- 10. Temporal Feature: Cyclical Encoding of Review Month -----
+# Encode month of last review as cyclical features using sine and cosine transformation.
+# This captures seasonal patterns smoothly for both linear and non-linear models.
+```{r}
+# Extract review month (1–12)
+train$review_month <- as.numeric(format(train$last_review, "%m"))
+test$review_month  <- as.numeric(format(test$last_review, "%m"))
+
+# Replace NAs (listings without reviews) with 0 → meaning no review
+train$review_month[is.na(train$review_month)] <- 0
+test$review_month[is.na(test$review_month)]   <- 0
+
+# Apply cyclical encoding (handle month = 0 separately)
+train$review_month_sin <- ifelse(train$review_month == 0, 0,
+                                 sin(2 * pi * train$review_month / 12))
+train$review_month_cos <- ifelse(train$review_month == 0, 0,
+                                 cos(2 * pi * train$review_month / 12))
+
+test$review_month_sin <- ifelse(test$review_month == 0, 0,
+                                sin(2 * pi * test$review_month / 12))
+test$review_month_cos <- ifelse(test$review_month == 0, 0,
+                                cos(2 * pi * test$review_month / 12))
+
+# Optional: visualize cyclical pattern
+month_grid <- data.frame(
+  month = 1:12,
+  sin = sin(2 * pi * (1:12) / 12),
+  cos = cos(2 * pi * (1:12) / 12)
+)
+
+ggplot(month_grid, aes(x = sin, y = cos, label = month)) +
+  geom_point(color = "steelblue", size = 3) +
+  geom_text(vjust = -1) +
+  coord_equal() +
+  labs(
+    title = "Cyclical Encoding of Review Month (sin/cos)",
+    x = "sin(2π * month / 12)",
+    y = "cos(2π * month / 12)"
+  ) +
+  theme_minimal()
+```
+
+
+```{r}
+# ----- 11. Remove Original Date Columns -----
+train <- select(train, -last_review, -minimum_nights, -days_since_last_review, -latitude, -longitude)
+test  <- select(test,  -last_review, -minimum_nights, -days_since_last_review, -latitude, -longitude)
+```
+
+
+
+# ----- 12. Final Data Integrity Check -----
+```{r}
+cat("\nFinal missing value counts (train):\n")
+print(colSums(is.na(train)))
+cat("\nFinal missing value counts (test):\n")
+print(colSums(is.na(test)))
+
+cat("\nFinal training columns:\n")
+print(names(train))
+
+# ----- Correlation Analysis: log_price vs. Numerical Features -----
+
+# Select only numeric features
+numeric_features <- select_if(train, is.numeric)
+
+# Compute correlation matrix (complete cases only)
+cor_matrix <- cor(numeric_features, use = "complete.obs")
+
+# Print all correlations with log_price
+cat("\nCorrelation of numerical features with log_price:\n")
+print(sort(cor_matrix["log_price", ], decreasing = TRUE))
+
+# --- Visualize correlations with a bar plot ---
+
+# Convert correlations into a tidy dataframe for plotting
+cor_data <- data.frame(
+  feature = names(cor_matrix["log_price", ]),
+  correlation = cor_matrix["log_price", ]
+) %>%
+  filter(feature != "log_price") %>%                # exclude self-correlation
+  arrange(desc(abs(correlation)))                   # order by absolute correlation strength
+
+# Plot correlation strength
+ggplot(cor_data, aes(x = reorder(feature, correlation), y = correlation, fill = correlation > 0)) +
+  geom_bar(stat = "identity", show.legend = FALSE) +
+  coord_flip() +
+  labs(
+    title = "Correlation of Features with log_price",
+    x = "Feature",
+    y = "Pearson Correlation"
+  ) +
+  theme_minimal() +
+  geom_text(aes(label = round(correlation, 2)), hjust = ifelse(cor_data$correlation > 0, -0.2, 1.2), size = 3) +
+  scale_fill_manual(values = c("TRUE" = "steelblue", "FALSE" = "firebrick"))
+
+# ----- Multicollinearity Check: Correlation Heatmap -----
+
+library(reshape2)
+
+# Compute correlation matrix for numeric features
+cor_matrix <- cor(select_if(train, is.numeric), use = "complete.obs")
+
+# Melt matrix into long format for ggplot
+cor_melt <- melt(cor_matrix)
+
+# Round correlation values to 2 decimal places for labeling
+cor_melt$value <- round(cor_melt$value, 2)
+
+# Plot correlation heatmap with text annotations
+ggplot(cor_melt, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile(color = "white") +  # adds white gridlines
+  geom_text(aes(label = sprintf("%.2f", value)), size = 3) +  # two decimals
+  scale_fill_gradient2(
+    low = "firebrick",
+    mid = "white",
+    high = "steelblue",
+    midpoint = 0,
+    limits = c(-1, 1)
+  ) +
+  labs(
+    title = "Feature Correlation Heatmap (rounded to 2 decimals)",
+    x = "Feature",
+    y = "Feature",
+    fill = "Correlation"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank(),
+    plot.title = element_text(hjust = 0.5)
+  )
+```
+############################################################
+# 13.) RIDGE REGRESSION
+############################################################
+```{r}
+# Load Packages and Set Seed
+library(tidymodels)
+tidymodels_prefer()
+
+set.seed(123)
+
+# Zur Sicherheit 
+airbnb_train <- train
+airbnb_test  <- test
+
+```
+
+
+```{r}
+# 1. Preprocess data (Recipe)
+ridge_recipe <- recipe(log_price ~ ., data = airbnb_train) %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_predictors())   # Standardisierugn
+
+#  2. Specify model
+ridge_spec <- linear_reg(
+  mixture = 0,          # 0 = Ridge
+  penalty = tune()       # tuned Lambda 
+) %>%
+  set_mode("regression") %>%
+  set_engine("glmnet")
+
+# 3. Create workflow
+ridge_wf <- workflow() %>%
+  add_recipe(ridge_recipe) %>%
+  add_model(ridge_spec)
+
+# 4. Do cross validation
+airbnb_folds <- vfold_cv(airbnb_train, v = 10)
+
+# 5. Define values to be explored
+penalty_grid <- grid_regular(
+  penalty(range = c(-5, 5)), # entspricht 10^-5 bis 10^5
+  levels = 50
+)
+
+# 6. Tune model
+ridge_tune <- tune_grid(
+  ridge_wf,
+  resamples = airbnb_folds,
+  grid = penalty_grid,
+  metrics = metric_set(rmse, rsq)
+)
+
+# 7. Fit data to model
+best_ridge <- ridge_tune %>% select_best(metric = "rmse")
+
+# 8. Select best model
+best_ridge <- ridge_tune %>% select_best(metric = "rmse")
+
+# 9. Train final model
+ridge_final_wf <- ridge_wf %>% finalize_workflow(best_ridge)
+ridge_final_fit <- ridge_final_wf %>% fit(airbnb_train)
+
+# RMSE out of sample (testing data)
+ridge_pred <- augment(ridge_final_fit, new_data = airbnb_test) 
+
+ridge_pred <- ridge_pred %>%
+  mutate(predicted_price = exp(.pred) - 1)
+
+head(ridge_pred)         # Übersicht der Features + .pred
+ridge_pred$.pred         # Nur die log_price Vorhersagen
+ridge_pred$predicted_price  # Rücktransformierter Preis (falls berechnet)
+
+
+# Angenommen, die Reihenfolge der Zeilen entspricht den IDs
+submission_ridge <- ridge_pred %>%
+  mutate(ID = row_number(),                # fortlaufende IDs
+         price = predicted_price) %>%
+  select(ID, price)                        # nur die Spalten für Upload
+
+# Vorschau
+head(submission_ridge)
+
+
+```
+
+############################################################
+# 14.) LASSO REGRESSION
+############################################################
+
+```{r}
+
+# 1. Preprocess data (Recipe)
+lasso_recipe <- recipe(log_price ~ ., data = airbnb_train) %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_predictors())   # Standardisierung
+
+# 2. Specify model
+lasso_spec <- linear_reg(
+  mixture = 1,          # 1 = Lasso
+  penalty = tune()       # tuned Lambda
+) %>%
+  set_mode("regression") %>%
+  set_engine("glmnet")
+
+# 3. Create workflow
+lasso_wf <- workflow() %>%
+  add_recipe(lasso_recipe) %>%
+  add_model(lasso_spec)
+
+# 4️⃣ Do cross validation
+airbnb_folds <- vfold_cv(airbnb_train, v = 10)
+
+# 5️⃣ Define values to be explored
+penalty_grid <- grid_regular(
+  penalty(range = c(-5, 5)), # entspricht 10^-5 bis 10^5
+  levels = 50
+)
+
+# 6️⃣ Tune model
+lasso_tune <- tune_grid(
+  lasso_wf,
+  resamples = airbnb_folds,
+  grid = penalty_grid,
+  metrics = metric_set(rmse, rsq)
+)
+
+# 7️⃣ Select best model
+best_lasso <- lasso_tune %>% select_best(metric = "rmse")
+
+# 8️⃣ Train final model
+lasso_final_wf <- lasso_wf %>% finalize_workflow(best_lasso)
+lasso_final_fit <- lasso_final_wf %>% fit(airbnb_train)
+
+# 9️⃣ Predictions on test set (nur Features!)
+lasso_pred <- augment(lasso_final_fit, new_data = airbnb_test)
+
+# Rücktransformation log_price → price
+lasso_pred <- lasso_pred %>%
+  mutate(predicted_price = exp(.pred) - 1)
+
+# 10️⃣ Ausgabe
+head(lasso_pred)               # Übersicht der Features + .pred
+lasso_pred$.pred               # Nur log_price Vorhersagen
+lasso_pred$predicted_price     # Rücktransformierter Preis
+
+
+# Angenommen, die Reihenfolge der Zeilen entspricht den IDs
+submission <- lasso_pred %>%
+  mutate(ID = row_number(),                # fortlaufende IDs
+         price = predicted_price) %>%
+  select(ID, price)                        # nur die Spalten für Upload
+
+# Vorschau
+head(submission)
+
+
+```
+
