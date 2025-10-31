@@ -1,0 +1,659 @@
+
+RSME = 
+>> Refine Best: RMSE(log)=0.51119 @ 275 rounds
+
+
+
+
+############################################################
+# Airbnb Chicago Price Prediction - Data Preparation Script
+# Goal: Prepare data for regression modeling (minimize RMSE)
+############################################################
+
+# ----- 1. Load Required Libraries -----
+
+library(dplyr)
+library(ggplot2)
+library(geosphere)
+library(fastDummies)
+
+
+# ----- 2. Load Data -----
+
+# Read training and test data
+train_raw <- read.csv("~/Documents/Uni/Master/Machine learning/mlai-2025-regression-challenge/train.csv")
+test_raw  <- read.csv("~/Documents/Uni/Master/Machine learning/mlai-2025-regression-challenge/test.csv")
+
+# Create working copies to keep originals unchanged
+train <- train_raw
+test  <- test_raw
+
+# Display basic structure of the datasets
+cat("Training set summary:\n")
+summary(train)
+cat("\nTest set summary:\n")
+summary(test)
+
+
+# ----- 3. Basic Data Cleaning -----
+
+# Remove columns that do not contain predictive information
+train <- train %>% select(-ID, -host_id, -name, -host_name)
+test  <- test  %>% select(-ID, -host_id, -name, -host_name)
+
+# Check for missing values
+cat("\nMissing values per column (train):\n")
+print(colSums(is.na(train)))
+cat("\nMissing values per column (test):\n")
+print(colSums(is.na(test)))
+
+# Replace missing values in 'reviews_per_month' with 0
+# Interpretation: missing means no reviews yet
+train$reviews_per_month[is.na(train$reviews_per_month)] <- 0
+test$reviews_per_month[is.na(test$reviews_per_month)] <- 0
+
+# Verify that missing values have been handled
+cat("\nAfter imputation, missing values per column (train):\n")
+print(colSums(is.na(train)))
+
+
+# ----- 4. Variable Transformations -----
+
+# Apply a log transformation to price to reduce the impact of extreme outliers
+train <- train %>%
+  mutate(log_price = log1p(price))
+
+
+# ----- 5. Add Geographic Feature: Distance to City Center -----
+
+# Coordinates of Chicago’s main urban center (The Loop)
+center_lon <- -87.6298
+center_lat <- 41.8781
+
+# Calculate distance (in kilometers) to the city center using Haversine formula
+train$dist_to_center <- distHaversine(
+  cbind(train$longitude, train$latitude),
+  c(center_lon, center_lat)
+) / 1000
+
+test$dist_to_center <- distHaversine(
+  cbind(test$longitude, test$latitude),
+  c(center_lon, center_lat)
+) / 1000
+
+# Check distance distribution to ensure plausible range
+summary(train$dist_to_center)
+
+# ----- 5.1 Distance derivatives & proximity rings (non-linear distance patterns) -----
+add_distance_derivatives <- function(df) {
+  df$log_dist_to_center <- log1p(df$dist_to_center)
+  df$dist2_to_center    <- df$dist_to_center^2
+  for (r in c(2, 5, 10)) {
+    df[[paste0("within_", r, "km")]] <- as.integer(df$dist_to_center <= r)
+  }
+  df
+}
+train <- add_distance_derivatives(train)
+test  <- add_distance_derivatives(test)
+
+
+# ----- 6. Additional Feature Engineering -----
+
+# Create a review ratio (popularity measure) and log-transform minimum nights
+train <- train %>%
+  mutate(
+    reviews_ratio = number_of_reviews / (reviews_per_month + 1),
+    min_nights_log = log1p(minimum_nights)
+  )
+
+test <- test %>%
+  mutate(
+    reviews_ratio = number_of_reviews / (reviews_per_month + 1),
+    min_nights_log = log1p(minimum_nights)
+  )
+
+# Additional robust log transforms for skewed count features
+# Rationale: Make distributions more Gaussian-like for linear models and stabilize variance.
+train <- train %>%
+  mutate(
+    number_of_reviews_log = log1p(number_of_reviews),
+    reviews_per_month_log = log1p(reviews_per_month),
+    availability_365_log = log1p(availability_365),
+    calc_host_listings_log = log1p(calculated_host_listings_count)
+  )
+
+test <- test %>%
+  mutate(
+    number_of_reviews_log = log1p(number_of_reviews),
+    reviews_per_month_log = log1p(reviews_per_month),
+    availability_365_log = log1p(availability_365),
+    calc_host_listings_log = log1p(calculated_host_listings_count)
+  )
+
+# Confirm that no new missing values were introduced
+cat("\nCheck NAs after feature engineering:\n")
+print(colSums(is.na(train)))
+
+
+# ----- 7. Encode Room Type (One-Hot Encoding) -----
+
+# Convert categorical variable 'room_type' into dummy columns (0/1)
+train <- dummy_cols(train, select_columns = "room_type", remove_selected_columns = TRUE)
+test  <- dummy_cols(test,  select_columns = "room_type", remove_selected_columns = TRUE)
+
+# Confirm that encoding worked correctly
+cat("\nEncoded room_type columns in train:\n")
+print(names(train)[grepl("room_type_", names(train))])
+
+# Check if train and test have matching column names
+setdiff(names(train), names(test))
+
+# ----- 7.1 Ensure train/test have identical columns after encoding -----
+# Create any missing columns in test and reorder columns to match train.
+align_columns <- function(train_df, test_df) {
+  missing_cols <- setdiff(names(train_df), names(test_df))
+  for (col in missing_cols) test_df[[col]] <- 0
+  extra_cols <- setdiff(names(test_df), names(train_df))
+  if (length(extra_cols) > 0) test_df <- test_df[, setdiff(names(test_df), extra_cols)]
+  test_df <- test_df[, names(train_df)]
+  test_df
+}
+
+# Do NOT include target columns in alignment
+tmp_train_X <- train %>% dplyr::select(-price, -log_price)
+test <- align_columns(tmp_train_X, test)
+
+# ----- 7.2 Interactions: distance × room type (after dummies & alignment) -----
+# Robust to naming: find columns that start with 'room_type' and include "Private/Entire/Shared".
+private_col <- grep("^room_type[_.]Private", names(train), value = TRUE)[1]
+entire_col  <- grep("^room_type[_.]Entire",  names(train), value = TRUE)[1]
+shared_col  <- grep("^room_type[_.]Shared",  names(train), value = TRUE)[1]
+
+if (!is.na(private_col)) {
+  train$dist_x_private <- train$dist_to_center * as.integer(train[[private_col]] == 1)
+  test$dist_x_private  <- test$dist_to_center  * as.integer(test[[private_col]]  == 1)
+}
+if (!is.na(entire_col)) {
+  train$dist_x_entire <- train$dist_to_center * as.integer(train[[entire_col]] == 1)
+  test$dist_x_entire  <- test$dist_to_center  * as.integer(test[[entire_col]]  == 1)
+}
+if (!is.na(shared_col)) {
+  train$dist_x_shared <- train$dist_to_center * as.integer(train[[shared_col]] == 1)
+  test$dist_x_shared  <- test$dist_to_center  * as.integer(test[[shared_col]]  == 1)
+}
+
+
+# ----- 8 Helper: Out-of-Fold Target Encoding with smoothing -----
+# Why: Prevents target leakage by computing per-neighbourhood means out-of-fold.
+# alpha controls smoothing towards the global mean (helps for rare neighbourhoods).
+
+oof_target_encode <- function(df, col, target, k = 5, alpha = 20, seed = 42) {
+  set.seed(seed)
+  folds <- sample(rep(1:k, length.out = nrow(df)))
+  global <- mean(df[[target]], na.rm = TRUE)
+  
+  enc_vec <- numeric(nrow(df))
+  for (f in 1:k) {
+    tr <- df[folds != f, , drop = FALSE]
+    te_idx <- which(folds == f)
+    
+    stats <- tr |>
+      dplyr::group_by(.data[[col]]) |>
+      dplyr::summarise(n = dplyr::n(),
+                       m = mean(.data[[target]], na.rm = TRUE),
+                       .groups = "drop") |>
+      dplyr::mutate(m_smooth = (n*m + alpha*global) / (n + alpha)) |>
+      dplyr::select(dplyr::all_of(col), m_smooth)
+    
+    joined <- df[te_idx, c(col), drop = FALSE] |>
+      dplyr::left_join(stats, by = col)
+    
+    enc_vec[te_idx] <- ifelse(is.na(joined$m_smooth), global, joined$m_smooth)
+  }
+  
+  # mapping for test / new data:
+  mapping <- df |>
+    dplyr::group_by(.data[[col]]) |>
+    dplyr::summarise(n = dplyr::n(),
+                     m = mean(.data[[target]], na.rm = TRUE),
+                     .groups = "drop") |>
+    dplyr::mutate(m_smooth = (n*m + alpha*global) / (n + alpha)) |>
+    dplyr::select(dplyr::all_of(col), m_smooth)
+  
+  list(oof = enc_vec, mapping = mapping, global = global)
+}
+
+# ----- 8.0a Neighbourhood Frequency Encoding (size/popularity; train-only mapping) -----
+neigh_count <- train %>%
+  dplyr::group_by(neighbourhood) %>%
+  dplyr::summarise(neigh_n = dplyr::n(), .groups = "drop")
+
+train <- train %>% dplyr::left_join(neigh_count, by = "neighbourhood")
+test  <- test  %>% dplyr::left_join(neigh_count, by = "neighbourhood")
+test$neigh_n[is.na(test$neigh_n)] <- 0  # unseen neighbourhoods → 0
+
+# ----- 8.1 Encode Neighbourhood (Out-of-Fold Target Encoding with smoothing) -----
+# Motivation: Avoid leakage by computing neighbourhood means out-of-fold on train.
+# We create 'neigh_te' for train via OOF, and map smoothed means to test.
+
+# Ensure neighbourhood is present as character/factor:
+train$neighbourhood <- as.character(train$neighbourhood)
+test$neighbourhood  <- as.character(test$neighbourhood)
+
+enc <- oof_target_encode(train, col = "neighbourhood", target = "log_price",
+                         k = 5, alpha = 20, seed = 42)
+
+train$neigh_te <- enc$oof
+
+# Map to test set (unseen neighbourhoods -> global mean)
+test <- test |>
+  dplyr::left_join(enc$mapping, by = "neighbourhood")
+test$neigh_te <- ifelse(is.na(test$m_smooth), enc$global, test$m_smooth)
+
+# Drop original neighbourhood column (we keep the encoded version)
+train <- dplyr::select(train, -neighbourhood)
+test  <- dplyr::select(test,  -neighbourhood, -m_smooth)
+
+# Quick sanity check
+summary(train$neigh_te)
+
+# ----- 8.0b Geo-Cluster Feature (k-means on lon/lat) + OOF target encoding -----
+# Clusters approximate local micro-neighbourhoods; OOF-TE avoids leakage.
+set.seed(42)
+xy_train <- as.matrix(train[, c("longitude","latitude")])
+xy_train_sc <- scale(xy_train)
+sc_center <- attr(xy_train_sc, "scaled:center")
+sc_scale  <- attr(xy_train_sc, "scaled:scale")
+
+km <- kmeans(xy_train_sc, centers = 20, nstart = 20)
+train$geo_cluster <- factor(km$cluster)
+
+# Map clusters to test via nearest centroid in the same scaled space
+xy_test  <- as.matrix(test[, c("longitude","latitude")])
+xy_test_sc <- scale(xy_test, center = sc_center, scale = sc_scale)
+centers <- km$centers
+nearest_centroid <- function(x, centers) {
+  # returns index of closest center (squared Euclidean)
+  which.min(colSums((t(centers) - x)^2))
+}
+test$geo_cluster <- factor(apply(xy_test_sc, 1, nearest_centroid, centers = centers))
+
+# OOF target-encode the cluster id
+enc_gc <- oof_target_encode(
+  df = transform(train, gc = as.character(geo_cluster)),
+  col = "gc",
+  target = "log_price",
+  k = 5, alpha = 20, seed = 42
+)
+train$geo_cluster_te <- enc_gc$oof
+gc_map <- enc_gc$mapping; names(gc_map)[1] <- "gc"
+tmp_gc <- dplyr::left_join(
+  data.frame(gc = as.character(test$geo_cluster)),
+  gc_map, by = "gc"
+)
+test$geo_cluster_te <- ifelse(is.na(tmp_gc$m_smooth), enc_gc$global, tmp_gc$m_smooth)
+
+# Keep only encoded version to keep matrix small
+train$geo_cluster <- NULL
+test$geo_cluster  <- NULL
+
+
+# ----- 9. Temporal Feature: Days Since Last Review -----
+
+# Convert 'last_review' to Date format
+train$last_review <- as.Date(train$last_review)
+test$last_review  <- as.Date(test$last_review)
+
+# Identify the most recent review date using TRAIN ONLY (avoid test peek)
+ref_date <- max(as.Date(train_raw$last_review), na.rm = TRUE)
+cat("\nReference date (most recent review in dataset):", ref_date, "\n")
+
+# Calculate number of days since the last review
+train <- train %>%
+  mutate(days_since_last_review = as.numeric(ref_date - last_review))
+test <- test %>%
+  mutate(days_since_last_review = as.numeric(ref_date - last_review))
+
+# Replace NAs (no reviews) using TRAIN-only maximum to avoid test peek
+max_days_train <- max(train$days_since_last_review, na.rm = TRUE)
+train$days_since_last_review[is.na(train$days_since_last_review)] <- max_days_train
+test$days_since_last_review[is.na(test$days_since_last_review)]  <- max_days_train
+
+# Log-transform for numerical stability
+train$log_days_since_last_review <- log1p(train$days_since_last_review)
+test$log_days_since_last_review  <- log1p(test$days_since_last_review)
+
+# Basic summary for verification
+cat("\nSummary of 'days_since_last_review':\n")
+summary(train$days_since_last_review)
+
+# Visualization of the distribution
+ggplot(train, aes(x = days_since_last_review)) +
+  geom_histogram(fill = "steelblue", bins = 30) +
+  labs(title = "Distribution of Days Since Last Review",
+       x = "Days since last review",
+       y = "Count")
+
+
+# ----- 10. Temporal Feature: Cyclical Encoding of Review Month -----
+# Encode month of last review as cyclical features using sine and cosine transformation.
+# This captures seasonal patterns smoothly for both linear and non-linear models.
+
+# Extract review month (1–12)
+train$review_month <- as.numeric(format(train$last_review, "%m"))
+test$review_month  <- as.numeric(format(test$last_review, "%m"))
+
+# Replace NAs (listings without reviews) with 0 → meaning no review
+train$review_month[is.na(train$review_month)] <- 0
+test$review_month[is.na(test$review_month)]   <- 0
+
+# Apply cyclical encoding (handle month = 0 separately)
+train$review_month_sin <- ifelse(train$review_month == 0, 0,
+                                 sin(2 * pi * train$review_month / 12))
+train$review_month_cos <- ifelse(train$review_month == 0, 0,
+                                 cos(2 * pi * train$review_month / 12))
+
+test$review_month_sin <- ifelse(test$review_month == 0, 0,
+                                sin(2 * pi * test$review_month / 12))
+test$review_month_cos <- ifelse(test$review_month == 0, 0,
+                                cos(2 * pi * test$review_month / 12))
+
+# Missingness flags (explicit signals for "no review"/"no month")
+train$has_review <- as.integer(!is.na(train$last_review))
+test$has_review  <- as.integer(!is.na(test$last_review))
+train$review_month_missing <- as.integer(train$review_month == 0)
+test$review_month_missing  <- as.integer(test$review_month == 0)
+
+# Optional: visualize cyclical pattern
+month_grid <- data.frame(
+  month = 1:12,
+  sin = sin(2 * pi * (1:12) / 12),
+  cos = cos(2 * pi * (1:12) / 12)
+)
+
+ggplot(month_grid, aes(x = sin, y = cos, label = month)) +
+  geom_point(color = "steelblue", size = 3) +
+  geom_text(vjust = -1) +
+  coord_equal() +
+  labs(
+    title = "Cyclical Encoding of Review Month (sin/cos)",
+    x = "sin(2π * month / 12)",
+    y = "cos(2π * month / 12)"
+  ) +
+  theme_minimal()
+
+
+# ----- 11. Remove Original Date Columns (keep lat/lon for geo signal) -----
+# Keep latitude & longitude (useful for tree models and for potential splines).
+train <- dplyr::select(train, -last_review, -minimum_nights, -days_since_last_review)
+test  <- dplyr::select(test,  -last_review, -minimum_nights, -days_since_last_review)
+
+
+# ----- 12. Final Data Integrity Check -----
+
+cat("\nFinal missing value counts (train):\n")
+print(colSums(is.na(train)))
+cat("\nFinal missing value counts (test):\n")
+print(colSums(is.na(test)))
+
+cat("\nFinal training columns:\n")
+print(names(train))
+
+# ----- Correlation Analysis: log_price vs. Numerical Features -----
+
+# Select only numeric features
+numeric_features <- select_if(train, is.numeric)
+
+# Compute correlation matrix (complete cases only)
+cor_matrix <- cor(numeric_features, use = "complete.obs")
+
+# Print all correlations with log_price
+cat("\nCorrelation of numerical features with log_price:\n")
+print(sort(cor_matrix["log_price", ], decreasing = TRUE))
+
+# --- Visualize correlations with a bar plot ---
+
+# Convert correlations into a tidy dataframe for plotting
+cor_data <- data.frame(
+  feature = names(cor_matrix["log_price", ]),
+  correlation = cor_matrix["log_price", ]
+) %>%
+  filter(feature != "log_price") %>%                # exclude self-correlation
+  arrange(desc(abs(correlation)))                   # order by absolute correlation strength
+
+# Plot correlation strength
+ggplot(cor_data, aes(x = reorder(feature, correlation), y = correlation, fill = correlation > 0)) +
+  geom_bar(stat = "identity", show.legend = FALSE) +
+  coord_flip() +
+  labs(
+    title = "Correlation of Features with log_price",
+    x = "Feature",
+    y = "Pearson Correlation"
+  ) +
+  theme_minimal() +
+  geom_text(aes(label = round(correlation, 2)), hjust = ifelse(cor_data$correlation > 0, -0.2, 1.2), size = 3) +
+  scale_fill_manual(values = c("TRUE" = "steelblue", "FALSE" = "firebrick"))
+
+# ----- Multicollinearity Check: Correlation Heatmap -----
+
+library(reshape2)
+
+# Compute correlation matrix for numeric features
+cor_matrix <- cor(select_if(train, is.numeric), use = "complete.obs")
+
+# Melt matrix into long format for ggplot
+cor_melt <- melt(cor_matrix)
+
+# Round correlation values to 2 decimal places for labeling
+cor_melt$value <- round(cor_melt$value, 2)
+
+# Plot correlation heatmap with text annotations
+ggplot(cor_melt, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile(color = "white") +  # adds white gridlines
+  geom_text(aes(label = sprintf("%.2f", value)), size = 3) +  # two decimals
+  scale_fill_gradient2(
+    low = "firebrick",
+    mid = "white",
+    high = "steelblue",
+    midpoint = 0,
+    limits = c(-1, 1)
+  ) +
+  labs(
+    title = "Feature Correlation Heatmap (rounded to 2 decimals)",
+    x = "Feature",
+    y = "Feature",
+    fill = "Correlation"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank(),
+    plot.title = element_text(hjust = 0.5)
+  )
+
+cat("\n[Info] Train rows/cols:", nrow(train), ncol(train), "\n")
+cat("[Info] Test  rows/cols:", nrow(test),  ncol(test),  "\n")
+common_cols <- intersect(names(train), names(test))
+cat("[Info] Common feature columns (excl. target):", length(setdiff(common_cols, c("price","log_price"))), "\n")
+
+
+############################################################
+
+############################################################
+# XGBoost – Fast Grid + Top-K Refine + Early Stopping
+# (Drop-in für Steps 13–15; setzt train/test + Features voraus)
+############################################################
+
+# ---- Pakete ----
+library(xgboost)
+library(caret)
+library(Matrix)
+library(dplyr)
+library(parallel)
+library(doParallel)
+
+# ---- Parallel sauber aufsetzen (Folds/Grids parallel, Fits single-threaded) ----
+NUM_WORKERS <- max(1, parallel::detectCores() - 1)
+cl <- parallel::makeCluster(NUM_WORKERS)
+doParallel::registerDoParallel(cl)
+on.exit(stopCluster(cl), add = TRUE)
+
+# verhindert Oversubscription in xgboost-Fits:
+Sys.setenv(OMP_NUM_THREADS = "1", MKL_NUM_THREADS = "1")
+
+# ---- Falls X/Y noch nicht existieren (Safety) ----
+if (!exists("X_train") || !exists("y_train") || !exists("X_test")) {
+  X_train <- train %>% dplyr::select(-price, -log_price)
+  y_train <- train$log_price
+  X_test  <- test
+}
+
+# ---- Helper: RMSE auf Original-Preisskala ----
+rmse_price <- function(y_log, yhat_log) {
+  y <- expm1(y_log); yhat <- expm1(yhat_log)
+  sqrt(mean((yhat - y)^2))
+}
+
+# ---- DMatrix für Feintuning/Finale ----
+dtrain <- xgb.DMatrix(data = as.matrix(X_train), label = y_train)
+
+# ============================================================
+# Step 14 (ersetzt): Schnelles Grid in caret (5-Fold CV)
+# ============================================================
+set.seed(42)
+xgb_grid <- expand.grid(
+  nrounds          = c(200, 320),    # kleines, wirksames Budget
+  max_depth        = c(6, 8),
+  eta              = c(0.03),
+  gamma            = c(0),
+  colsample_bytree = c(0.75, 0.90),
+  min_child_weight = c(3, 5),
+  subsample        = c(0.75, 0.90)
+)
+
+train_control <- trainControl(
+  method = "cv",
+  number = 5,
+  verboseIter = TRUE,
+  allowParallel = TRUE
+)
+
+xgb_tuned <- train(
+  x = as.matrix(X_train),
+  y = y_train,
+  trControl = train_control,
+  tuneGrid  = xgb_grid,
+  method    = "xgbTree",
+  metric    = "RMSE",
+  nthread   = 1,               # wichtig: ein Thread pro Fit
+  tree_method = "hist"         # schnell & stabil
+)
+
+cat("[Grid size]:", nrow(xgb_grid), "Kombinationen; Total Fits =", nrow(xgb_grid)*5, "\n")
+cat("\n>> Fast-Grid bestTune & RMSE:\n"); print(xgb_tuned$bestTune); print(min(xgb_tuned$results$RMSE))
+
+# ============================================================
+# Step 15 (ersetzt): Top-K Refine mit xgb.cv + Early Stopping
+# ============================================================
+topK <- xgb_tuned$results %>%
+  arrange(RMSE) %>%
+  head(4)
+
+refine_rows <- list()
+best_overall <- list(score = Inf)
+
+for (i in seq_len(nrow(topK))) {
+  row <- topK[i, ]
+  params_refine <- list(
+    objective         = "reg:squarederror",
+    eval_metric       = "rmse",
+    eta               = row$eta,
+    max_depth         = row$max_depth,
+    subsample         = row$subsample,
+    colsample_bytree  = row$colsample_bytree,
+    min_child_weight  = row$min_child_weight,
+    gamma             = row$gamma,
+    tree_method       = "hist",
+    nthread           = 1
+  )
+  
+  set.seed(42 + i)
+  cv <- xgb.cv(
+    params = params_refine,
+    data   = dtrain,
+    nrounds = 2500,
+    nfold   = 5,
+    early_stopping_rounds = 120,
+    prediction = TRUE,     # erlaubt OOF-RMSE auf Preisskala
+    verbose = 0
+  )
+  
+  score_log <- cv$evaluation_log$test_rmse_mean[cv$best_iteration]
+  oof_price <- rmse_price(y_train, cv$pred)
+  
+  refine_rows[[i]] <- data.frame(
+    i = i,
+    eta = row$eta,
+    max_depth = row$max_depth,
+    subsample = row$subsample,
+    colsample_bytree = row$colsample_bytree,
+    min_child_weight = row$min_child_weight,
+    gamma = row$gamma,
+    best_iteration = cv$best_iteration,
+    rmse_log = score_log,
+    oof_rmse_price = oof_price
+  )
+  
+  if (score_log < best_overall$score) {
+    best_overall <- list(
+      params    = params_refine,
+      best_iter = cv$best_iteration,
+      score     = score_log
+    )
+  }
+}
+
+refine_summary <- do.call(rbind, refine_rows)
+cat("\n>> Refine Summary (Top-K):\n"); print(refine_summary)
+cat(sprintf("\n>> Refine Best: RMSE(log)=%.5f @ %d rounds\n",
+            best_overall$score, best_overall$best_iter))
+
+# ============================================================
+# Final Training mit besten Params + Runden
+# ============================================================
+final_model <- xgb.train(
+  params  = best_overall$params,
+  data    = dtrain,
+  nrounds = best_overall$best_iter,
+  print_every_n = 50
+)
+
+# ---- Metriken (Train) ----
+pred_train_log <- predict(final_model, as.matrix(X_train))
+rmse_log_train <- sqrt(mean((pred_train_log - y_train)^2))
+rmse_price_train <- rmse_price(y_train, pred_train_log)
+cat(sprintf("\nTrain RMSE (log)=%.5f | RMSE(price)=%.2f\n",
+            rmse_log_train, rmse_price_train))
+
+# ---- Feature-Importance (optional Plot) ----
+importance <- xgb.importance(model = final_model)
+xgb.plot.importance(importance, top_n = 15, rel_to_first = TRUE,
+                    xlab = "Relative Importance",
+                    main = "Final XGBoost Feature Importance")
+
+# ============================================================
+# Test-Predictions + Submission
+# ============================================================
+dtest <- xgb.DMatrix(data = as.matrix(X_test))
+test_pred_log   <- predict(final_model, dtest)
+test_pred_price <- expm1(test_pred_log)
+
+submission <- data.frame(
+  ID = test_raw$ID,
+  price = round(test_pred_price, 2)
+)
+
+out_file <- "submission_xgb_fastrefine.csv"
+write.csv(submission, out_file, row.names = FALSE)
+cat(sprintf("\n✅ Fertig. Submission gespeichert als '%s'\n", out_file))
+############################################################
