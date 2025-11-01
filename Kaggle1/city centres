@@ -1,0 +1,31 @@
+# (B) Geo landmarks / reference points
+loop_lat <- 41.8781; loop_lon <- -87.6298
+ord_lat  <- 41.9742; ord_lon  <- -87.9073
+mdw_lat  <- 41.7868; mdw_lon  <- -87.7522
+navy_lat <- 41.8917; navy_lon <- -87.6078
+bean_lat <- 41.8826; bean_lon <- -87.6233
+
+fe_build <- function(df, ref_date) {
+  out <- df
+  
+  # Dates & temporal features
+  out$last_review <- as.Date(out$last_review)
+  out$days_since_last_review <- as.numeric(ref_date - out$last_review)
+  max_days <- max(out$days_since_last_review, na.rm = TRUE)
+  out$days_since_last_review[is.na(out$days_since_last_review)] <- max_days
+  out$log_days_since_last_review <- log1p(out$days_since_last_review)
+  
+  # Cyclical seasonality
+  month <- as.integer(format(out$last_review, "%m"))
+  month[is.na(month)] <- 0
+  out$review_month_sin <- ifelse(month == 0, 0, sin(2*pi*month/12))
+  out$review_month_cos <- ifelse(month == 0, 0, cos(2*pi*month/12))
+  # keep only sin/cos; raw "review_month" will be dropped later if present
+  
+  # Distances
+  out$dist_to_loop_km <- dist_hav_km(out$latitude, out$longitude, loop_lat, loop_lon)
+  out$dist_to_ord_km  <- dist_hav_km(out$latitude, out$longitude, ord_lat,  ord_lon)
+  out$dist_to_mdw_km  <- dist_hav_km(out$latitude, out$longitude, mdw_lat,  mdw_lon)
+  out$dist_to_navy_km <- dist_hav_km(out$latitude, out$longitude, navy_lat, navy_lon)
+  out$dist_to_bean_km <- dist_hav_km(out$latitude, out$longitude, bean_lat, bean_lon)
+  out$dist_to_center  <- dist_hav_km(out$latitude, out$longitu
