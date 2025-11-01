@@ -13,4 +13,4 @@ bean_lat <- 41.8826; bean_lon <- -87.6233
   out$dist_to_mdw_km  <- dist_hav_km(out$latitude, out$longitude, mdw_lat,  mdw_lon)
   out$dist_to_navy_km <- dist_hav_km(out$latitude, out$longitude, navy_lat, navy_lon)
   out$dist_to_bean_km <- dist_hav_km(out$latitude, out$longitude, bean_lat, bean_lon)
-  out$dist_to_center  <- dist_hav_km(out$latitude, out$longitu
+  out$dist_to_center  <- dist_hav_km(out$latitude, out$longitu# (B) Geo landmarks / reference points
