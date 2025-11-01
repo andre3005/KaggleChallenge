@@ -5,6 +5,8 @@
 
 # ----- 1. Load Required Libraries -----
 ```{r}
+rm(list = ls())
+
 library(dplyr)
 library(ggplot2)
 library(geosphere)
@@ -14,8 +16,8 @@ library(fastDummies)
 # ----- 2. Load Data -----
 ```{r}
 # Read training and test data
-train_raw <- read.csv("~/Documents/Uni/Master/Machine learning/mlai-2025-regression-challenge/train.csv")
-test_raw  <- read.csv("~/Documents/Uni/Master/Machine learning/mlai-2025-regression-challenge/test.csv")
+train_raw <- read.csv("/Users/andreschmidt/Documents/UniProgramming/Kaggle/KaggleChallenge/Kaggle1/mlai-2025-regression-challenge/train.csv")
+test_raw  <- read.csv("/Users/andreschmidt/Documents/UniProgramming/Kaggle/KaggleChallenge/Kaggle1/mlai-2025-regression-challenge/test.csv")
 
 # Create working copies to keep originals unchanged
 train <- train_raw
@@ -32,7 +34,7 @@ summary(test)
 ```{r}
 # Remove columns that do not contain predictive information
 train <- train %>% select(-ID, -host_id, -name, -host_name)
-test  <- test  %>% select(-ID, -host_id, -name, -host_name)
+test  <- test  %>% select(-host_id, -name, -host_name)
 
 # Check for missing values
 cat("\nMissing values per column (train):\n")
@@ -110,6 +112,8 @@ print(names(train)[grepl("room_type_", names(train))])
 
 # Check if train and test have matching column names
 setdiff(names(train), names(test))
+
+
 ```
 
 # ----- 8. Encode Neighbourhood (Target Mean Encoding) -----
@@ -220,8 +224,8 @@ ggplot(month_grid, aes(x = sin, y = cos, label = month)) +
 
 ```{r}
 # ----- 11. Remove Original Date Columns -----
-train <- select(train, -last_review, -minimum_nights, -days_since_last_review, -latitude, -longitude)
-test  <- select(test,  -last_review, -minimum_nights, -days_since_last_review, -latitude, -longitude)
+train <- select(train, -last_review, -minimum_nights, -days_since_last_review, -longtitude, -latitude)
+test  <- select(test,  -last_review, -minimum_nights, -days_since_last_review, -longtitude, -latitude)
 ```
 
 
@@ -308,6 +312,22 @@ ggplot(cor_melt, aes(x = Var1, y = Var2, fill = value)) +
     plot.title = element_text(hjust = 0.5)
   )
 ```
+
+
+
+##split data
+```{r}
+set.seed(9)
+train_split <- initial_split( train, prop = 0.8 )
+train_split
+
+t_train <- training( train_split )
+t_test <- testing( train_split )
+
+t_train <- t_train %>%
+  dplyr::select(-price)
+```
+
 
 # ==========================================================
 # 13) REGRESSION SPLINES (Natural Splines über Distanz/Koordinaten)
