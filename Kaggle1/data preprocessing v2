@@ -1,0 +1,366 @@
+############################################################
+# Airbnb Chicago Price Prediction - Data Preparation + XGBoost
+# Objective: Prepare features and train a regression model that
+#            is SELECTED by RMSE on the original price scale.
+#            We still track log-RMSE for analysis/tiebreaking.
+#            Test predictions on price use Duan's smearing.
+############################################################
+
+# -------------------------------
+# 1) Load Required Libraries
+# -------------------------------
+library(dplyr)        # Data wrangling
+library(ggplot2)      # Exploratory plots
+library(geosphere)    # Haversine distance
+library(fastDummies)  # One-hot encoding for categorical features
+library(reshape2)     # Correlation heatmap prep
+
+# For modeling (later sections)
+library(xgboost)      # Gradient boosting
+library(caret)        # Quick model grids / CV helpers
+library(Matrix)       # Sparse/dense matrix conversions
+library(parallel)     # Parallel workers
+library(doParallel)   # caret parallel backend
+
+set.seed(42)          # Reproducibility across the entire pipeline
+
+# -------------------------------
+# 2) Load Data
+# -------------------------------
+# NOTE: Adjust paths to your environment if needed.
+train_raw <- read.csv("~/Documents/Uni/Master/Machine learning/mlai-2025-regression-challenge/train.csv")
+test_raw  <- read.csv("~/Documents/Uni/Master/Machine learning/mlai-2025-regression-challenge/test.csv")
+
+# Work on copies to keep originals intact
+train <- train_raw
+test  <- test_raw
+
+cat("Training set summary:\n"); summary(train)
+cat("\nTest set summary:\n");    summary(test)
+
+# -------------------------------
+# 3) Basic Data Cleaning
+# -------------------------------
+# Remove columns that do not provide predictive signal or would trivially leak IDs.
+train <- train %>% select(-ID, -host_id, -name, -host_name)
+test  <- test  %>% select(-ID, -host_id, -name, -host_name)
+
+# NA overview (sanity check)
+cat("\nMissing values per column (train):\n"); print(colSums(is.na(train)))
+cat("\nMissing values per column (test):\n");  print(colSums(is.na(test)))
+
+# Impute 'reviews_per_month' with 0 (interpretation: no reviews yet → effectively zero rate)
+train$reviews_per_month[is.na(train$reviews_per_month)] <- 0
+test$reviews_per_month[is.na(test$reviews_per_month)]   <- 0
+
+cat("\nAfter imputation, missing values per column (train):\n"); print(colSums(is.na(train)))
+
+# -------------------------------
+# 4) Target Transformation
+# -------------------------------
+# We log-transform the target to stabilize variance and mitigate heavy right tails.
+# NOTE: The assignment's evaluation is on the ORIGINAL price scale (RMSE on price),
+#       so we will SELECT the final model by RMSE(price) later, even though training
+#       occurs on log(price). We keep both metrics for full transparency.
+train <- train %>% mutate(log_price = log1p(price))
+
+# -------------------------------
+# 5) Geographic Feature: Distance to City Center (Chicago Loop)
+# -------------------------------
+# Coordinates for Chicago's main urban center (The Loop)
+center_lon <- -87.6298
+center_lat <- 41.8781
+
+# Haversine distance in kilometers
+train$dist_to_center <- distHaversine(cbind(train$longitude, train$latitude),
+                                      c(center_lon, center_lat)) / 1000
+test$dist_to_center  <- distHaversine(cbind(test$longitude,  test$latitude),
+                                      c(center_lon, center_lat)) / 1000
+
+cat("\nDistance-to-center summary (train):\n"); summary(train$dist_to_center)
+
+# 5.1 Distance derivatives & proximity rings (nonlinear patterns wrt distance)
+add_distance_derivatives <- function(df) {
+  df$log_dist_to_center <- log1p(df$dist_to_center)      # diminishing returns
+  df$dist2_to_center    <- df$dist_to_center^2           # allow quadratic curvature
+  for (r in c(2, 5, 10)) {                               # coarse proximity bands
+    df[[paste0("within_", r, "km")]] <- as.integer(df$dist_to_center <= r)
+  }
+  df
+}
+train <- add_distance_derivatives(train)
+test  <- add_distance_derivatives(test)
+
+# -------------------------------
+# 6) Additional Feature Engineering
+# -------------------------------
+# Ratios/logs to stabilize skew and approximate linear additivity for linear parts,
+# while still benefiting tree-based models (robust to monotonic transforms).
+train <- train %>%
+  mutate(
+    reviews_ratio          = number_of_reviews / (reviews_per_month + 1),
+    min_nights_log         = log1p(minimum_nights),
+    number_of_reviews_log  = log1p(number_of_reviews),
+    reviews_per_month_log  = log1p(reviews_per_month),
+    availability_365_log   = log1p(availability_365),
+    calc_host_listings_log = log1p(calculated_host_listings_count)
+  )
+
+test <- test %>%
+  mutate(
+    reviews_ratio          = number_of_reviews / (reviews_per_month + 1),
+    min_nights_log         = log1p(minimum_nights),
+    number_of_reviews_log  = log1p(number_of_reviews),
+    reviews_per_month_log  = log1p(reviews_per_month),
+    availability_365_log   = log1p(availability_365),
+    calc_host_listings_log = log1p(calculated_host_listings_count)
+  )
+
+cat("\nCheck NAs after feature engineering (train):\n"); print(colSums(is.na(train)))
+
+# -------------------------------
+# 7) Encode Categorical: Room Type (One-Hot)
+# -------------------------------
+train <- dummy_cols(train, select_columns = "room_type", remove_selected_columns = TRUE)
+test  <- dummy_cols(test,  select_columns = "room_type", remove_selected_columns = TRUE)
+
+cat("\nEncoded room_type columns in train:\n")
+print(names(train)[grepl("room_type_", names(train))])
+
+# Ensure train/test have identical feature columns after encoding;
+# IMPORTANT: do NOT include 'price' or 'log_price' in this alignment.
+align_columns <- function(train_df, test_df) {
+  missing_cols <- setdiff(names(train_df), names(test_df))
+  for (col in missing_cols) test_df[[col]] <- 0
+  extra_cols <- setdiff(names(test_df), names(train_df))
+  if (length(extra_cols) > 0) test_df <- test_df[, setdiff(names(test_df), extra_cols)]
+  test_df <- test_df[, names(train_df)]
+  test_df
+}
+tmp_train_X <- train %>% dplyr::select(-price, -log_price)
+test <- align_columns(tmp_train_X, test)
+
+# Interactions: distance × room type to allow different distance-price slopes by segment
+private_col <- grep("^room_type[_.]Private", names(train), value = TRUE)[1]
+entire_col  <- grep("^room_type[_.]Entire",  names(train), value = TRUE)[1]
+shared_col  <- grep("^room_type[_.]Shared",  names(train), value = TRUE)[1]
+
+if (!is.na(private_col)) {
+  train$dist_x_private <- train$dist_to_center * as.integer(train[[private_col]] == 1)
+  test$dist_x_private  <- test$dist_to_center  * as.integer(test[[private_col]]  == 1)
+}
+if (!is.na(entire_col)) {
+  train$dist_x_entire <- train$dist_to_center * as.integer(train[[entire_col]] == 1)
+  test$dist_x_entire  <- test$dist_to_center  * as.integer(test[[entire_col]]  == 1)
+}
+if (!is.na(shared_col)) {
+  train$dist_x_shared <- train$dist_to_center * as.integer(train[[shared_col]] == 1)
+  test$dist_x_shared  <- test$dist_to_center  * as.integer(test[[shared_col]]  == 1)
+}
+
+# -------------------------------
+# 8) Target Encoding (OOF) to avoid leakage
+# -------------------------------
+# We perform out-of-fold target encoding for high-cardinality location signals:
+# (a) neighbourhood (categorical) and (b) geo micro-clusters (k-means on lon/lat).
+# OOF ensures that each row's encoded value is computed without peeking at its own target.
+
+oof_target_encode <- function(df, col, target, k = 5, alpha = 20, seed = 42) {
+  set.seed(seed)
+  folds <- sample(rep(1:k, length.out = nrow(df)))
+  global <- mean(df[[target]], na.rm = TRUE)
+  
+  enc_vec <- numeric(nrow(df))
+  for (f in 1:k) {
+    tr <- df[folds != f, , drop = FALSE]
+    te_idx <- which(folds == f)
+    
+    stats <- tr |>
+      dplyr::group_by(.data[[col]]) |>
+      dplyr::summarise(n = dplyr::n(),
+                       m = mean(.data[[target]], na.rm = TRUE),
+                       .groups = "drop") |>
+      dplyr::mutate(m_smooth = (n*m + alpha*global) / (n + alpha)) |>
+      dplyr::select(dplyr::all_of(col), m_smooth)
+    
+    joined <- df[te_idx, c(col), drop = FALSE] |>
+      dplyr::left_join(stats, by = col)
+    
+    enc_vec[te_idx] <- ifelse(is.na(joined$m_smooth), global, joined$m_smooth)
+  }
+  
+  # Mapping for test/new data:
+  mapping <- df |>
+    dplyr::group_by(.data[[col]]) |>
+    dplyr::summarise(n = dplyr::n(),
+                     m = mean(.data[[target]], na.rm = TRUE),
+                     .groups = "drop") |>
+    dplyr::mutate(m_smooth = (n*m + alpha*global) / (n + alpha)) |>
+    dplyr::select(dplyr::all_of(col), m_smooth)
+  
+  list(oof = enc_vec, mapping = mapping, global = global)
+}
+
+# 8.0a Frequency of 'neighbourhood' (size/popularity proxy; computed on train only)
+neigh_count <- train %>%
+  dplyr::group_by(neighbourhood) %>%
+  dplyr::summarise(neigh_n = dplyr::n(), .groups = "drop")
+
+train <- train %>% dplyr::left_join(neigh_count, by = "neighbourhood")
+test  <- test  %>% dplyr::left_join(neigh_count, by = "neighbourhood")
+test$neigh_n[is.na(test$neigh_n)] <- 0  # unseen neighbourhoods in test → 0
+
+# 8.1 OOF target encoding for 'neighbourhood'
+train$neighbourhood <- as.character(train$neighbourhood)
+test$neighbourhood  <- as.character(test$neighbourhood)
+
+enc <- oof_target_encode(train, col = "neighbourhood", target = "log_price",
+                         k = 5, alpha = 20, seed = 42)
+train$neigh_te <- enc$oof
+
+test <- test |> dplyr::left_join(enc$mapping, by = "neighbourhood")
+test$neigh_te <- ifelse(is.na(test$m_smooth), enc$global, test$m_smooth)
+
+# Drop raw 'neighbourhood' (keep only encoded version to reduce dimensionality)
+train <- dplyr::select(train, -neighbourhood)
+test  <- dplyr::select(test,  -neighbourhood, -m_smooth)
+
+cat("\nOOF target-encoded 'neigh_te' summary (train):\n"); summary(train$neigh_te)
+
+# 8.0b Geo micro-clusters (k-means on standardized lon/lat) + OOF target encoding
+set.seed(42)
+xy_train    <- as.matrix(train[, c("longitude","latitude")])
+xy_train_sc <- scale(xy_train)
+sc_center   <- attr(xy_train_sc, "scaled:center")
+sc_scale    <- attr(xy_train_sc, "scaled:scale")
+
+km <- kmeans(xy_train_sc, centers = 20, nstart = 20)  # moderate granularity
+train$geo_cluster <- factor(km$cluster)
+
+# Assign test rows to nearest centroid in the same standardized space
+xy_test    <- as.matrix(test[, c("longitude","latitude")])
+xy_test_sc <- scale(xy_test, center = sc_center, scale = sc_scale)
+centers    <- km$centers
+nearest_centroid <- function(x, centers) which.min(colSums((t(centers) - x)^2))
+test$geo_cluster <- factor(apply(xy_test_sc, 1, nearest_centroid, centers = centers))
+
+# OOF-encode the cluster id against log_price
+enc_gc <- oof_target_encode(
+  df = transform(train, gc = as.character(geo_cluster)),
+  col = "gc", target = "log_price", k = 5, alpha = 20, seed = 42
+)
+train$geo_cluster_te <- enc_gc$oof
+gc_map <- enc_gc$mapping; names(gc_map)[1] <- "gc"
+tmp_gc <- dplyr::left_join(data.frame(gc = as.character(test$geo_cluster)),
+                           gc_map, by = "gc")
+test$geo_cluster_te <- ifelse(is.na(tmp_gc$m_smooth), enc_gc$global, tmp_gc$m_smooth)
+
+# Keep only encoded version to keep the design matrix compact
+train$geo_cluster <- NULL
+test$geo_cluster  <- NULL
+
+# -------------------------------
+# 9) Temporal Features (review recency & seasonality)
+# -------------------------------
+# a) Days since last review (recency proxy) computed using TRAIN-ONLY reference date
+train$last_review <- as.Date(train$last_review)
+test$last_review  <- as.Date(test$last_review)
+
+ref_date <- max(as.Date(train_raw$last_review), na.rm = TRUE)  # TRAIN ONLY reference
+cat("\nReference date (most recent review in TRAIN):", ref_date, "\n")
+
+train <- train %>% mutate(days_since_last_review = as.numeric(ref_date - last_review))
+test  <- test  %>% mutate(days_since_last_review = as.numeric(ref_date - last_review))
+
+# Missing last_review → set to the maximum observed days (train-only) to avoid peek
+max_days_train <- max(train$days_since_last_review, na.rm = TRUE)
+train$days_since_last_review[is.na(train$days_since_last_review)] <- max_days_train
+test$days_since_last_review[is.na(test$days_since_last_review)]   <- max_days_train
+
+# Log-transform for stability
+train$log_days_since_last_review <- log1p(train$days_since_last_review)
+test$log_days_since_last_review  <- log1p(test$days_since_last_review)
+
+cat("\nSummary of 'days_since_last_review' (train):\n"); summary(train$days_since_last_review)
+
+# b) Seasonality of the last review month via cyclical encoding (sin/cos)
+train$review_month <- as.numeric(format(train$last_review, "%m"))
+test$review_month  <- as.numeric(format(test$last_review,  "%m"))
+
+# Listings without reviews → month = 0; use explicit indicator and set sin/cos to 0
+train$review_month[is.na(train$review_month)] <- 0
+test$review_month[is.na(test$review_month)]   <- 0
+
+train$review_month_sin <- ifelse(train$review_month == 0, 0,
+                                 sin(2 * pi * train$review_month / 12))
+train$review_month_cos <- ifelse(train$review_month == 0, 0,
+                                 cos(2 * pi * train$review_month / 12))
+test$review_month_sin  <- ifelse(test$review_month == 0, 0,
+                                 sin(2 * pi * test$review_month / 12))
+test$review_month_cos  <- ifelse(test$review_month == 0, 0,
+                                 cos(2 * pi * test$review_month / 12))
+
+train$has_review            <- as.integer(!is.na(train$last_review))
+test$has_review             <- as.integer(!is.na(test$last_review))
+train$review_month_missing  <- as.integer(train$review_month == 0)
+test$review_month_missing   <- as.integer(test$review_month == 0)
+
+# -------------------------------
+# 10) Remove Raw Date Columns (keep lat/lon for geo signal)
+# -------------------------------
+train <- dplyr::select(train, -last_review, -minimum_nights, -days_since_last_review)
+test  <- dplyr::select(test,  -last_review, -minimum_nights, -days_since_last_review)
+
+# -------------------------------
+# 11) Final Integrity Checks
+# -------------------------------
+cat("\nFinal missing value counts (train):\n"); print(colSums(is.na(train)))
+cat("\nFinal missing value counts (test):\n");  print(colSums(is.na(test)))
+cat("\nFinal training columns:\n");              print(names(train))
+
+# Correlation diagnostics (optional but useful for reporting)
+numeric_features <- dplyr::select_if(train, is.numeric)
+cor_matrix <- cor(numeric_features, use = "complete.obs")
+cat("\nCorrelation of numerical features with log_price:\n")
+print(sort(cor_matrix["log_price", ], decreasing = TRUE))
+
+# Bar plot of correlations (optional)
+cor_data <- data.frame(
+  feature = names(cor_matrix["log_price", ]),
+  correlation = cor_matrix["log_price", ]
+) %>%
+  filter(feature != "log_price") %>%
+  arrange(desc(abs(correlation)))
+ggplot(cor_data, aes(x = reorder(feature, correlation), y = correlation, fill = correlation > 0)) +
+  geom_bar(stat = "identity", show.legend = FALSE) +
+  coord_flip() +
+  labs(title = "Correlation of Features with log_price",
+       x = "Feature", y = "Pearson Correlation") +
+  theme_minimal()
+
+# Heatmap (optional)
+cor_melt <- melt(cor_matrix); cor_melt$value <- round(cor_melt$value, 2)
+ggplot(cor_melt, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = sprintf("%.2f", value)), size = 3) +
+  scale_fill_gradient2(low = "firebrick", mid = "white", high = "steelblue",
+                       midpoint = 0, limits = c(-1, 1)) +
+  labs(title = "Feature Correlation Heatmap", x = "Feature", y = "Feature", fill = "Correlation") +
+  theme_minimal() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+cat("\n[Info] Train rows/cols:", nrow(train), ncol(train), "\n")
+cat("[Info] Test  rows/cols:", nrow(test),  ncol(test),  "\n")
+common_cols <- intersect(names(train), names(test))
+cat("[Info] Common feature columns (excl. target):",
+    length(setdiff(common_cols, c("price","log_price"))), "\n")
+
+# =====================================================================
+# 12.5) FINAL SAFETY ALIGN + Feature Matrices for Modeling (CRITICAL)
+# =====================================================================
+# Ensure test and train share the exact same feature set (excluding targets),
+# then build X/y matrices. This alignment before modeling avoids any mismatch.
+test <- align_columns(train %>% dplyr::select(-price, -log_price), test)
+
+X_train <- train %>% dplyr::select(-price, -log_price)
+y_train <- train$log_price
+X_test  <- test
